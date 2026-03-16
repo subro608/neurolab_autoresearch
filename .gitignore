@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+*.pt
+*.pth
+autoloop_stdout.log
+run.log
+eval.log
+next_proposal.json

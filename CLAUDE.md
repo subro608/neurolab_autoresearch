@@ -156,7 +156,7 @@ The backbone and dataset loaders live outside this folder (project-specific — 
 5. **LLM backend** (optional — only for stuck-detection fallback): set `AUTOLOOP_LLM` to one of:
    - `claude` (default) — requires [Claude Code](https://claude.ai/code) CLI installed
    - `codex` — requires [OpenAI Codex CLI](https://github.com/openai/codex) installed
-   - `openai` — requires `OPENAI_API_KEY` env var
+   - `openai` — requires `OPENAI_API_KEY` env var + `uv add openai`
    - `ollama` — requires [Ollama](https://ollama.com) + `ollama pull qwen3:8b`
    - `none` — disable the built-in fallback entirely (supervisor fills queue manually)
 
@@ -347,11 +347,14 @@ AUTOLOOP_LLM=openai nohup ~/.local/bin/uv run python3 autoloop.py >> autoloop_st
 client can connect to for interactive arxiv/HuggingFace search:
 
 ```bash
+# First: edit mcp_config.json and replace __AUTORESEARCH_DIR__ with your actual path
+# e.g. /Users/you/myproject/autoresearch
+
 # Connect Claude Code interactively to the search server
 claude --mcp-config mcp_config.json "search arxiv for contrastive SSL brain decoding"
 
-# Connect Codex interactively
-codex exec -c 'mcp_servers=[{name="search",command="uv",args=["run","python","search_server.py"]}]' "..."
+# Or run the search server directly to test it
+uv run python3 search_server.py
 ```
 
 ### What the LLM fallback does

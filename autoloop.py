@@ -373,24 +373,35 @@ def _llm_call_ollama(prompt: str, system: str, timeout: int) -> str | None:
 
 def claude_call(prompt: str, system: str = "", allow_web_search: bool = False,
                 timeout: int = 180) -> str | None:
-    """Dispatch to the configured LLM backend (AUTOLOOP_LLM env var)."""
-    if AUTOLOOP_LLM == "claude":
-        return _llm_call_claude(prompt, system, allow_web_search, timeout)
-    elif AUTOLOOP_LLM == "codex":
-        if allow_web_search:
-            log("codex backend does not support web search — skipping research_propose")
-            return None
-        return _llm_call_codex(prompt, system, allow_web_search, timeout)
-    elif AUTOLOOP_LLM == "openai":
-        return _llm_call_openai(prompt, system, allow_web_search, timeout)
-    elif AUTOLOOP_LLM == "ollama":
-        return _llm_call_ollama(prompt, system, timeout)
-    elif AUTOLOOP_LLM == "none":
+    """Dispatch to the configured LLM backend (AUTOLOOP_LLM env var). Retries up to 3 times."""
+    if AUTOLOOP_LLM == "none":
         log("LLM disabled (AUTOLOOP_LLM=none) — skipping proposal generation")
         return None
-    else:
+    if AUTOLOOP_LLM not in ("claude", "codex", "openai", "ollama"):
         log(f"Unknown AUTOLOOP_LLM={AUTOLOOP_LLM!r} — valid: claude, codex, openai, ollama, none")
         return None
+    if AUTOLOOP_LLM == "codex" and allow_web_search:
+        log("codex backend does not support web search — skipping research_propose")
+        return None
+
+    for attempt in range(1, 4):  # 3 attempts total
+        if attempt > 1:
+            log(f"LLM retry {attempt}/3 ...")
+            time.sleep(5 * (attempt - 1))  # 5s, then 10s between retries
+        if AUTOLOOP_LLM == "claude":
+            result = _llm_call_claude(prompt, system, allow_web_search, timeout)
+        elif AUTOLOOP_LLM == "codex":
+            result = _llm_call_codex(prompt, system, allow_web_search, timeout)
+        elif AUTOLOOP_LLM == "openai":
+            result = _llm_call_openai(prompt, system, allow_web_search, timeout)
+        elif AUTOLOOP_LLM == "ollama":
+            result = _llm_call_ollama(prompt, system, timeout)
+        if result:
+            return result
+        log(f"LLM attempt {attempt}/3 returned nothing")
+
+    log("All 3 LLM attempts failed")
+    return None
 
 
 def _parse_proposal_json(content: str) -> dict | None:

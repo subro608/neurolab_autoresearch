@@ -16,11 +16,14 @@ while True:
     4. Evaluate (linear probe → metric)
     5. metric improved? → git commit (keep) : git checkout (discard)
     6. Log to results.tsv
-    7. If queue empty + stuck → search arxiv → local LLM proposes
+    7. If queue empty + stuck (≥3 discards):
+         a. autoloop queries arxiv + HuggingFace Papers via search_server.py
+         b. injects paper results as text into LLM prompt
+         c. LLM backend proposes next experiment
     8. repeat
 ```
 
-A **supervisor LLM** (Claude, GPT, Gemini — via cron) reads the loop state every 10 minutes, restarts if crashed, and refills the proposal queue with new ideas. No Ollama required if the supervisor keeps the queue filled.
+A **supervisor LLM** (Claude, GPT, Gemini — via cron) reads the loop state every 10 minutes, restarts if crashed, and refills the proposal queue with new ideas. The built-in LLM fallback is pluggable: `claude`, `codex`, `openai`, `ollama`, or `none` (see [LLM Backends](#llm-backends)).
 
 ---
 
@@ -83,13 +86,14 @@ uv run python3 dashboard.py           # terminal TUI (15s refresh)
 | `autoloop.py` | Core loop engine — **never edit** |
 | `train.py` | **Only file the loop modifies** — your training script |
 | `evaluate.py` | Locked metric evaluator — **never modify** |
+| `search_server.py` | FastMCP server: `search_arxiv` + `search_huggingface_papers` tools; also imported directly by autoloop for backend-agnostic paper search |
+| `mcp_config.json` | MCP config for connecting any MCP-compatible LLM client to `search_server.py` interactively |
 | `proposal_queue.json` | FIFO queue of pending experiments |
 | `next_proposal.json` | One-off override — autoloop pops + deletes it |
 | `results.tsv` | Full experiment history |
 | `autoloop_stdout.log` | Live loop output |
 | `dashboard.py` | Terminal TUI with sparklines and live config |
 | `monitor.py` | Simpler 30s-refresh dashboard |
-| `ollama_agent.py` | Standalone Ollama proposal agent (optional) |
 | `program.md` | Human-owned problem statement — LLM reads, human edits |
 | `experiment.md` | Human-readable experiment notes |
 | `CLAUDE.md` | Full onboarding doc for any LLM supervisor |
@@ -117,14 +121,41 @@ uv run python3 dashboard.py           # terminal TUI (15s refresh)
 
 ---
 
+## LLM Backends
+
+When the queue runs dry and the loop is stuck (≥3 consecutive discards), autoloop calls an LLM automatically. Set `AUTOLOOP_LLM` before starting:
+
+| Value | Backend | Notes |
+|-------|---------|-------|
+| `claude` (default) | `claude --print` CLI | Requires Claude Code installed |
+| `codex` | `codex exec` CLI | Requires OpenAI Codex CLI + login |
+| `openai` | OpenAI API (gpt-4o) | Requires `OPENAI_API_KEY` |
+| `ollama` | Local Ollama REST API | Set `OLLAMA_MODEL` (default: `qwen3:8b`) |
+| `none` | Disabled | Supervisor fills queue manually only |
+
+All backends receive **identical** arxiv + HuggingFace Papers search results injected as plain text by `search_server.py` — no tool-calling support required from the LLM.
+
+```bash
+# Default (Claude)
+nohup ~/.local/bin/uv run python3 autoloop.py >> autoloop_stdout.log 2>&1 &
+
+# Ollama
+AUTOLOOP_LLM=ollama nohup ~/.local/bin/uv run python3 autoloop.py >> autoloop_stdout.log 2>&1 &
+
+# OpenAI
+AUTOLOOP_LLM=openai OPENAI_API_KEY=sk-... nohup ~/.local/bin/uv run python3 autoloop.py >> autoloop_stdout.log 2>&1 &
+```
+
+---
+
 ## Supervisor Role (LLM via cron)
 
-Any LLM can act as supervisor — no local Ollama needed. The loop only calls Ollama as a last resort when the queue is empty and it has been stuck for 3+ iterations.
+Any LLM can act as supervisor — no special local setup needed. The built-in fallback (above) only activates when the queue is empty and the loop has been stuck for 3+ iterations.
 
 **Cron check (every 10 min):**
 1. Read last 30 lines of `autoloop_stdout.log`
 2. Read `results.tsv` and `proposal_queue.json`
-3. If crashed → restart: `nohup uv run python3 autoloop.py >> autoloop_stdout.log 2>&1 &`
+3. If crashed → restart: `nohup ~/.local/bin/uv run python3 autoloop.py >> autoloop_stdout.log 2>&1 &`
 4. If queue < 3 items → add 2–3 new proposals
 5. Otherwise → do nothing
 
@@ -148,7 +179,11 @@ Everything else (autoloop, dashboard, proposal queue) works unchanged.
 - Python 3.10+, managed by [uv](https://github.com/astral-sh/uv)
 - `git` on PATH (autoloop uses `git commit` / `git checkout` to track experiments)
 - PyTorch (CUDA, MPS, or CPU — auto-detected)
-- Ollama + `qwen3:8b` (optional — only for stuck-detection fallback)
+- One of the LLM backends (optional — only for stuck-detection fallback):
+  - Claude Code CLI (`claude`) — default
+  - OpenAI Codex CLI (`codex`)
+  - OpenAI API key (`OPENAI_API_KEY`)
+  - [Ollama](https://ollama.com) + `ollama pull qwen3:8b`
 
 ---
 

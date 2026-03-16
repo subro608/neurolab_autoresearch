@@ -56,8 +56,11 @@ It is **project-agnostic** — point it at any `train.py` + `evaluate.py` pair. 
 9. Any hard constraints on train.py?
    (e.g. "do not change BATCH_SIZE", "keep auxiliary lambdas at 0")
 
-10. Do you want Ollama (local LLM) as a fallback proposal generator?
-    (only needed if the queue runs dry and you can't supervise manually)
+10. Which LLM backend do you want for the built-in fallback proposal generator?
+    (only activates when the queue runs dry and stuck for ≥3 iterations)
+    Options: claude (default, needs Claude Code CLI) | codex (needs Codex CLI) |
+             openai (needs OPENAI_API_KEY) | ollama (needs Ollama + qwen3:8b) | none (manual only)
+    Set via: AUTOLOOP_LLM=<value> before starting autoloop.py
 ```
 
 Once the user has answered, **write their answers to `program.md`** and confirm before running anything.
@@ -121,11 +124,10 @@ autoresearch/
 └── .venv/                  ← managed by uv
 ```
 
-The model backbone lives outside this folder (project-specific):
+The backbone and dataset loaders live outside this folder (project-specific — replace with your own paths):
 ```
-../Lfp2vec_benchmarks/backbones/whisper_distill_backbone.py   ← the neural network
-../Lfp2vec_benchmarks/backbones/__init__.py                   ← get_backbone() factory
-../blind_localization/data/lazyloader_dataset.py              ← CompactDataset
+../your_project/backbone.py        ← the neural network (must expose encode())
+../your_project/dataset.py         ← dataset loader
 ```
 
 ---
@@ -151,8 +153,12 @@ The model backbone lives outside this folder (project-specific):
 
 4. **Device**: training loop auto-detects CUDA → MPS → CPU. No config needed.
 
-5. **Ollama (optional)**: only for autoloop's stuck-detection fallback.
-   Install [Ollama](https://ollama.com) and run `ollama pull qwen3:8b` if you want it.
+5. **LLM backend** (optional — only for stuck-detection fallback): set `AUTOLOOP_LLM` to one of:
+   - `claude` (default) — requires [Claude Code](https://claude.ai/code) CLI installed
+   - `codex` — requires [OpenAI Codex CLI](https://github.com/openai/codex) installed
+   - `openai` — requires `OPENAI_API_KEY` env var
+   - `ollama` — requires [Ollama](https://ollama.com) + `ollama pull qwen3:8b`
+   - `none` — disable the built-in fallback entirely (supervisor fills queue manually)
 
 6. **Git**: autoloop uses `git commit` / `git checkout train.py` to track experiments.
    The repo must have at least one commit and `git` must be on PATH.

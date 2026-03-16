@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "search": {
+      "command": "uv",
+      "args": ["run", "python", "search_server.py"],
+      "cwd": "__AUTORESEARCH_DIR__"
+    }
+  }
+}

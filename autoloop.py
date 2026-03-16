@@ -9,13 +9,14 @@ Cycle:
   4. Propose next experiment:
        a. proposal_queue.json  — pre-loaded manual/Claude proposals (highest priority)
        b. next_proposal.json   — single manual override
-       c. deep research        — arxiv search → qwen3:8b (triggered when stuck)
-       d. qwen3:8b             — standard autonomous proposal
+       c. deep research        — Claude CLI with WebSearch (arxiv + HuggingFace), triggered when stuck
+       d. Claude CLI           — standard autonomous proposal (no search)
   5. Edit train.py (apply changes)
   6. → repeat
 
 Stuck detection: if last 3 results are all discards or same description,
-automatically searches arxiv and feeds paper abstracts to qwen3:8b for novel ideas.
+autoloop queries arxiv + HuggingFace Papers directly via search_server.py and
+injects results into the LLM prompt — works with any AUTOLOOP_LLM backend.
 
 Run:
     cd autoresearch
@@ -42,20 +43,74 @@ EXPERIMENT = AUTORESEARCH_DIR / "experiment.md"
 RUN_LOG    = AUTORESEARCH_DIR / "run.log"
 CHECKPOINT = AUTORESEARCH_DIR / "run_checkpoint.pt"
 UV         = Path.home() / ".local/bin/uv"
-OLLAMA_URL = "http://localhost:11434/api/chat"
-OLLAMA_MODEL = "qwen3:8b"
+CLAUDE_CLI = Path.home() / ".local/bin/claude"
 ARXIV_API  = "http://export.arxiv.org/api/query"
+
+# LLM backend for autonomous proposal generation (fallback when queue is empty).
+# Set via env var AUTOLOOP_LLM. Options:
+#   claude   — Claude Code CLI (claude --print). Default if claude is on PATH.
+#   codex    — OpenAI Codex CLI (codex exec). Requires codex on PATH + login.
+#   openai   — OpenAI API directly via OPENAI_API_KEY env var (gpt-4o).
+#   ollama   — Local Ollama server. Set OLLAMA_MODEL (default: qwen3:8b).
+#   none     — Disable LLM fallback entirely; use lr×2 hardcoded fallback.
+AUTOLOOP_LLM   = os.environ.get("AUTOLOOP_LLM", "claude")
+OLLAMA_URL     = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_MODEL   = os.environ.get("OLLAMA_MODEL", "qwen3:8b")
 
 # Trigger deep research after this many consecutive non-improvements
 STUCK_THRESHOLD = 3
 
-ARXIV_QUERIES = [
-    "Data2Vec EMA teacher student self-supervised learning improvement audio",
-    "masked prediction self-supervised learning time series transformer architecture",
-    "EEG LFP neural signal self-supervised representation learning transformer",
-    "BYOL momentum encoder SSL linear probe improvement techniques",
-    "whisper encoder fine-tuning self-supervised downstream classification",
-]
+PROPOSE_SYSTEM = """You are an autonomous ML research assistant for the Alphabrain LFP brain region decoding project.
+Your job: propose and implement the single best next experiment to improve linear probe accuracy.
+
+Setup:
+- Dataset: compact_atlas_5k, 105 brain region classes (atlas_depth=9), ~5000 train/val samples
+- Backbone: whisper_distill — EMA teacher-student (Data2Vec-style) with distance contrastive loss
+- Objective: dist_lambda_raw=1.0 (distance contrastive is the main SSL loss), ssl_lambda_raw=0.0
+- Device: Apple M3 Max MPS. BATCH_SIZE=16 (hard MPS limit), GRAD_ACCUM=4, TIME_BUDGET=7200s
+- Current best probe_acc: 6.98% (random chance=0.95%, target=15%+)
+- Key distc params: dist_temperature, dist_sigma (spatial bandwidth in µm), num_negatives
+
+Rules:
+- Only modify BACKBONE_CONFIG values, optimizer HPs (LR/WD/WARMUP_STEPS), or TIME_BUDGET
+- Do NOT add or change auxiliary losses — xyz_lambda, distpred_lambda_raw must stay 0
+- dist_lambda_raw must stay 1.0 (it is the main objective, not auxiliary)
+- Do NOT change backbone name, data paths, atlas_depth, or BATCH_SIZE
+- Do NOT repeat any experiment already in results.tsv
+- The "old" string must match train.py EXACTLY (copy-paste, including spaces and inline comments)
+- Output EXACTLY this JSON (no markdown, no explanation):
+{
+  "description": "one-line description of the change and why",
+  "changes": [
+    {"old": "exact string to replace", "new": "replacement string"}
+  ]
+}
+"""
+
+RESEARCH_SYSTEM = """You are an autonomous ML research assistant for the Alphabrain LFP brain region decoding project.
+You will search arxiv and HuggingFace papers to find novel ideas, then implement ONE as a train.py change.
+
+Setup:
+- Dataset: compact_atlas_5k, 105 brain region classes (atlas_depth=9), ~5000 train/val samples
+- Backbone: whisper_distill — EMA teacher-student (Data2Vec-style) with distance contrastive loss
+- Objective: dist_lambda_raw=1.0, dist_temperature controls contrastive sharpness, dist_sigma is spatial bandwidth
+- Device: Apple M3 Max MPS. BATCH_SIZE=16, GRAD_ACCUM=4, TIME_BUDGET=7200s
+- Current best probe_acc: 6.98% (random=0.95%, target=15%+)
+
+Rules:
+- Only modify BACKBONE_CONFIG values, optimizer HPs (LR/WD/WARMUP_STEPS), or TIME_BUDGET
+- Do NOT add auxiliary losses — xyz_lambda, distpred_lambda_raw must stay 0
+- dist_lambda_raw must stay 1.0
+- The idea must be grounded in a paper you found
+- "old" must match train.py EXACTLY
+- Output EXACTLY this JSON (no markdown):
+{
+  "description": "one-line description citing the paper/idea",
+  "changes": [
+    {"old": "exact string to replace", "new": "replacement string"}
+  ]
+}
+"""
 
 # ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -186,29 +241,169 @@ def do_decide(probe_acc: float, description: str) -> bool:
 
 import requests  # noqa: E402  (stdlib-compat, always available via uv)
 
+# Search functions from the FastMCP server — called directly so any LLM backend
+# can benefit from arxiv/HuggingFace results injected into the prompt.
+try:
+    from search_server import _search_arxiv, _search_huggingface_papers
+except ImportError:
+    # Fallback stubs if fastmcp/httpx not yet installed
+    def _search_arxiv(query: str, max_results: int = 5) -> str:          # type: ignore[misc]
+        return f"[search_server not available — run: uv add fastmcp httpx]"
+    def _search_huggingface_papers(query: str, max_results: int = 5) -> str:  # type: ignore[misc]
+        return f"[search_server not available — run: uv add fastmcp httpx]"
 
-# ── arxiv search + stuck detection ───────────────────────────────────────────
 
-def search_arxiv(query: str, max_results: int = 4) -> list[dict]:
-    """Search arxiv and return list of {title, abstract}."""
+# ── LLM backend — pluggable via AUTOLOOP_LLM env var ─────────────────────────
+
+def _llm_call_claude(prompt: str, system: str, allow_web_search: bool,
+                     timeout: int) -> str | None:
+    """Claude Code CLI backend: `claude --print`."""
+    cmd = [str(CLAUDE_CLI), "--print", "--output-format", "text", "--model", "sonnet"]
+    if system:
+        cmd += ["--append-system-prompt", system]
+    if allow_web_search:
+        cmd += ["--allowedTools", "WebSearch"]
+    cmd.append(prompt)
     try:
-        resp = requests.get(ARXIV_API, params={
-            "search_query": query,
-            "max_results": max_results,
-            "sortBy": "relevance",
-        }, timeout=30)
-        resp.raise_for_status()
-        root = ET.fromstring(resp.text)
-        ns = {"a": "http://www.w3.org/2005/Atom"}
-        papers = []
-        for entry in root.findall("a:entry", ns):
-            title    = entry.find("a:title", ns).text.strip().replace("\n", " ")
-            abstract = entry.find("a:summary", ns).text.strip().replace("\n", " ")[:600]
-            papers.append({"title": title, "abstract": abstract})
-        return papers
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           cwd=AUTORESEARCH_DIR)
+        if r.returncode != 0:
+            log(f"claude call failed (exit {r.returncode}): {r.stderr[:300]}")
+            return None
+        return r.stdout.strip()
+    except subprocess.TimeoutExpired:
+        log(f"claude call timed out after {timeout}s")
+        return None
     except Exception as e:
-        log(f"arxiv search failed: {e}")
-        return []
+        log(f"claude call error: {e}")
+        return None
+
+
+def _llm_call_openai(prompt: str, system: str, allow_web_search: bool,
+                     timeout: int) -> str | None:
+    """OpenAI backend: gpt-4o via OPENAI_API_KEY. Web search via responses API."""
+    try:
+        from openai import OpenAI  # pip install openai
+        client = OpenAI(timeout=timeout)
+        if allow_web_search:
+            # Responses API with built-in web search tool
+            resp = client.responses.create(
+                model="gpt-4o",
+                instructions=system or None,
+                input=prompt,
+                tools=[{"type": "web_search_preview"}],
+            )
+            return resp.output_text.strip()
+        else:
+            resp = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    *([ {"role": "system", "content": system}] if system else []),
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            return resp.choices[0].message.content.strip()
+    except ImportError:
+        log("openai package not installed — run: uv add openai")
+        return None
+    except Exception as e:
+        log(f"openai call error: {e}")
+        return None
+
+
+def _llm_call_codex(prompt: str, system: str, allow_web_search: bool,
+                    timeout: int) -> str | None:
+    """OpenAI Codex CLI backend: `codex exec`. Requires codex on PATH + login."""
+    import shutil, tempfile
+    codex_bin = shutil.which("codex") or "codex"
+    full_prompt = f"{system}\n\n{prompt}" if system else prompt
+    # Write output to a temp file via -o flag (cleanest way to capture final response)
+    with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
+        out_file = f.name
+    try:
+        cmd = [
+            codex_bin, "exec",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--ephemeral",
+            "-o", out_file,
+            full_prompt,
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           cwd=AUTORESEARCH_DIR)
+        if r.returncode != 0:
+            log(f"codex call failed (exit {r.returncode}): {r.stderr[:300]}")
+            return None
+        if os.path.exists(out_file):
+            result = open(out_file).read().strip()
+            return result if result else r.stdout.strip()
+        return r.stdout.strip()
+    except subprocess.TimeoutExpired:
+        log(f"codex call timed out after {timeout}s")
+        return None
+    except Exception as e:
+        log(f"codex call error: {e}")
+        return None
+    finally:
+        try:
+            os.unlink(out_file)
+        except OSError:
+            pass
+
+
+def _llm_call_ollama(prompt: str, system: str, timeout: int) -> str | None:
+    """Ollama backend: local server via REST API. No web search support."""
+    try:
+        payload = {
+            "model": OLLAMA_MODEL,
+            "prompt": prompt,
+            "stream": False,
+        }
+        if system:
+            payload["system"] = system
+        r = requests.post(f"{OLLAMA_URL}/api/generate", json=payload, timeout=timeout)
+        r.raise_for_status()
+        return r.json().get("response", "").strip()
+    except requests.exceptions.ConnectionError:
+        log(f"Ollama not reachable at {OLLAMA_URL} — is it running?")
+        return None
+    except Exception as e:
+        log(f"ollama call error: {e}")
+        return None
+
+
+def claude_call(prompt: str, system: str = "", allow_web_search: bool = False,
+                timeout: int = 180) -> str | None:
+    """Dispatch to the configured LLM backend (AUTOLOOP_LLM env var)."""
+    if AUTOLOOP_LLM == "claude":
+        return _llm_call_claude(prompt, system, allow_web_search, timeout)
+    elif AUTOLOOP_LLM == "codex":
+        if allow_web_search:
+            log("codex backend does not support web search — skipping research_propose")
+            return None
+        return _llm_call_codex(prompt, system, allow_web_search, timeout)
+    elif AUTOLOOP_LLM == "openai":
+        return _llm_call_openai(prompt, system, allow_web_search, timeout)
+    elif AUTOLOOP_LLM == "ollama":
+        return _llm_call_ollama(prompt, system, timeout)
+    elif AUTOLOOP_LLM == "none":
+        log("LLM disabled (AUTOLOOP_LLM=none) — skipping proposal generation")
+        return None
+    else:
+        log(f"Unknown AUTOLOOP_LLM={AUTOLOOP_LLM!r} — valid: claude, codex, openai, ollama, none")
+        return None
+
+
+def _parse_proposal_json(content: str) -> dict | None:
+    """Extract and parse the first JSON object from a Claude response."""
+    m = re.search(r"\{.*\}", content, re.DOTALL)
+    if not m:
+        log(f"No JSON found in response: {content[:200]}")
+        return None
+    try:
+        return json.loads(m.group(0))
+    except json.JSONDecodeError as e:
+        log(f"JSON parse error: {e} — content: {content[:200]}")
+        return None
 
 
 def is_stuck() -> bool:
@@ -226,148 +421,106 @@ def is_stuck() -> bool:
     return all_discards or all_same_desc
 
 
-RESEARCH_SYSTEM = """You are an autonomous ML research assistant for the Alphabrain LFP brain region decoding project.
-You have been given summaries of recent research papers. Your job is to extract ONE concrete experiment idea
-from these papers and implement it as a change to train.py.
+def claude_propose(results_text: str, train_text: str) -> dict | None:
+    """Ask Claude CLI to propose the next experiment (no web search)."""
+    log("Asking Claude for next experiment proposal...")
+    prompt = f"""Current results.tsv (experiment history):
+{results_text}
 
-Dataset: compact_atlas_5k, 105 brain region classes (atlas_depth=9), ~5000 train/val samples.
-Backbone: whisper_distill (EMA teacher-student, MSE regression on masked positions, collapse-resistant).
-Device: Apple M3 Max MPS. batch_size=16 (MPS limit), GRAD_ACCUM=4, TIME_BUDGET=1800s.
-Current best probe_acc: ~6% (random=0.95%, target=15%+).
+Current train.py BACKBONE_CONFIG and optimizer HPs:
+{train_text}
 
-Rules:
-- Only modify BACKBONE_CONFIG values, optimizer HPs (LR/WD/WARMUP), or TIME_BUDGET.
-- Do NOT add auxiliary losses (xyz_lambda, dist_lambda_raw, distpred_lambda_raw must stay 0).
-- Do NOT change backbone name, data paths, atlas_depth, or batch_size.
-- The idea must come directly from one of the provided papers.
-- Output EXACTLY this JSON (no markdown, no explanation):
-{
-  "description": "one-line description citing the paper",
-  "changes": [
-    {"old": "exact string to replace", "new": "replacement string"}
-  ]
-}
-"""
+Propose the single best next experiment to improve probe_acc.
+Reason about what patterns you see in results — what worked, what didn't, what hasn't been tried.
+Output ONLY valid JSON, no markdown, no explanation."""
+    content = claude_call(prompt, system=PROPOSE_SYSTEM, allow_web_search=False)
+    if not content:
+        return None
+    result = _parse_proposal_json(content)
+    if result:
+        log(f"Claude proposal: {result.get('description', '?')}")
+    return result
+
 
 def research_propose(results_text: str, train_text: str) -> dict | None:
-    """Search arxiv for novel ideas, then ask qwen3:8b to implement one."""
-    log("Entering deep research mode — searching arxiv...")
-    all_papers = []
-    for q in ARXIV_QUERIES[:3]:  # 3 queries, 4 papers each = up to 12 papers
-        papers = search_arxiv(q, max_results=4)
-        all_papers.extend(papers)
-        if papers:
-            log(f"  arxiv: '{q[:50]}...' → {len(papers)} papers")
+    """Search arxiv + HuggingFace Papers directly, then ask ANY LLM backend to propose.
 
-    if not all_papers:
-        log("arxiv search returned nothing — falling back to ollama_propose")
-        return ollama_propose(results_text, train_text)
+    Search is done by autoloop itself (backend-agnostic) — results are injected as
+    text into the prompt, so codex/openai/claude all get the same paper context.
+    """
+    log("Entering deep research mode — querying arxiv + HuggingFace Papers...")
 
-    # De-duplicate by title
-    seen, unique = set(), []
-    for p in all_papers:
-        if p["title"] not in seen:
-            seen.add(p["title"])
-            unique.append(p)
-    all_papers = unique[:10]
-
-    paper_text = "\n\n".join(
-        f"[{i+1}] {p['title']}\n{p['abstract']}" for i, p in enumerate(all_papers)
-    )
-
-    user_msg = f"""Recent papers on SSL improvement:
-
-{paper_text}
-
-Current results.tsv:
+    # Step 1: ask the LLM what to search for (short response, no search needed)
+    query_prompt = f"""Experiment history (results.tsv):
 {results_text}
 
-Current train.py:
+Current BACKBONE_CONFIG:
 {train_text}
 
-Based on one of the above papers, propose the single most promising change to improve probe_acc.
-Output only JSON.
-"""
-    payload = {
-        "model": OLLAMA_MODEL,
-        "messages": [
-            {"role": "system", "content": RESEARCH_SYSTEM},
-            {"role": "user",   "content": user_msg},
-        ],
-        "stream": False,
-    }
-    try:
-        resp = requests.post(OLLAMA_URL, json=payload, timeout=180)
-        resp.raise_for_status()
-        content = resp.json()["message"]["content"].strip()
-        content = re.sub(r"^```[a-z]*\n?", "", content)
-        content = re.sub(r"\n?```$", "", content)
-        m = re.search(r"\{.*\}", content, re.DOTALL)
-        if not m:
-            log(f"Research propose returned non-JSON: {content[:200]}")
-            return None
-        result = json.loads(m.group(0))
-        log(f"Research proposal: {result.get('description','?')}")
-        return result
-    except Exception as e:
-        log(f"Research propose failed: {e}")
-        return None
+We are stuck — last several experiments did not improve probe_acc.
+Output ONLY a JSON array of 2-3 targeted arxiv/HuggingFace search queries that might find
+novel ideas to unblock us. Be specific (e.g. "distance contrastive loss spatial embeddings").
+Example: ["query one", "query two", "query three"]"""
 
+    queries_raw = claude_call(query_prompt, system=RESEARCH_SYSTEM, allow_web_search=False, timeout=60)
+    queries: list[str] = []
+    if queries_raw:
+        m = re.search(r"\[.*?\]", queries_raw, re.DOTALL)
+        if m:
+            try:
+                queries = [q for q in json.loads(m.group(0)) if isinstance(q, str)]
+            except json.JSONDecodeError:
+                pass
+    if not queries:
+        # Fallback queries based on current objective
+        queries = [
+            "distance contrastive self-supervised learning spatial coordinates",
+            "contrastive SSL neural signals brain region classification",
+        ]
+    log(f"Search queries: {queries}")
 
-PROPOSE_SYSTEM = """You are an autonomous ML research assistant for the Alphabrain LFP brain region decoding project.
-Your job: propose and implement the single best next experiment to improve linear probe accuracy.
+    # Step 2: run searches directly — no LLM tool calls needed
+    search_results = ""
+    for q in queries[:3]:
+        arxiv_hits = _search_arxiv(q, max_results=3)
+        hf_hits    = _search_huggingface_papers(q, max_results=3)
+        search_results += f"\n\n### Arxiv: \"{q}\"\n{arxiv_hits}"
+        search_results += f"\n\n### HuggingFace Papers: \"{q}\"\n{hf_hits}"
 
-Dataset: compact_atlas_5k, 105 brain region classes (atlas_depth=9), ~5000 train/val samples.
-Backbone: whisper_distill (EMA teacher-student, collapse-resistant MSE loss). NOT contrastive.
-Device: Apple M3 Max MPS. batch_size=16 (MPS limit), GRAD_ACCUM=4, TIME_BUDGET=1800s.
+    # Step 3: ask LLM to propose based on injected search results
+    propose_prompt = f"""You are improving a distance contrastive SSL model for LFP brain region decoding.
 
-Rules:
-- Only modify BACKBONE_CONFIG values, optimizer HPs (LR/WD/WARMUP), or TIME_BUDGET.
-- Do NOT change the backbone name, data paths, atlas_depth, or batch_size.
-- Output EXACTLY this JSON (no markdown, no explanation):
-{
-  "description": "one-line description of the change",
+Experiment history (results.tsv):
+{results_text}
+
+Current BACKBONE_CONFIG + optimizer:
+{train_text}
+
+Papers found by search:
+{search_results}
+
+From the papers above, extract ONE concrete idea that:
+- Has NOT been tried already (check results.tsv carefully)
+- Can be implemented as a BACKBONE_CONFIG or optimizer HP change in train.py
+- Is grounded in a specific paper found above
+
+Output ONLY valid JSON (no markdown):
+{{
+  "description": "one-line description citing the paper",
   "changes": [
-    {"old": "exact string to replace", "new": "replacement string"}
+    {{"old": "exact string in train.py", "new": "replacement string"}}
   ]
-}
-"""
-
-def ollama_propose(results_text: str, train_text: str) -> dict | None:
-    """Ask qwen3:8b to propose the next experiment. Returns {description, changes}."""
-    user_msg = f"""
-Current results.tsv:
-{results_text}
-
-Current train.py:
-{train_text}
-
-Propose the single best next change. Output only JSON.
-"""
-    payload = {
-        "model": OLLAMA_MODEL,
-        "messages": [
-            {"role": "system", "content": PROPOSE_SYSTEM},
-            {"role": "user", "content": user_msg},
-        ],
-        "stream": False,
-    }
-    try:
-        resp = requests.post(OLLAMA_URL, json=payload, timeout=120)
-        resp.raise_for_status()
-        content = resp.json()["message"]["content"].strip()
-        # Strip markdown code fences if present
-        content = re.sub(r"^```[a-z]*\n?", "", content)
-        content = re.sub(r"\n?```$", "", content)
-        # Extract first JSON object
-        m = re.search(r"\{.*\}", content, re.DOTALL)
-        if not m:
-            log(f"Ollama returned non-JSON: {content[:200]}")
-            return None
-        return json.loads(m.group(0))
-    except Exception as e:
-        log(f"Ollama propose failed: {e}")
-        return None
+}}"""
+    content = claude_call(propose_prompt, system=RESEARCH_SYSTEM, allow_web_search=False, timeout=180)
+    if not content:
+        log("Research propose failed — falling back to claude_propose")
+        return claude_propose(results_text, train_text)
+    result = _parse_proposal_json(content)
+    if result:
+        log(f"Research proposal: {result.get('description', '?')}")
+        return result
+    log("Research propose returned no valid JSON — falling back to claude_propose")
+    return claude_propose(results_text, train_text)
 
 
 def apply_changes(changes: list[dict]) -> bool:
@@ -458,7 +611,7 @@ def main():
             log(f"Iteration {iteration} done: probe_acc={probe_acc:.4f} status={status}")
 
         # 4+5. Propose next experiment
-        # Priority: proposal_queue.json (array, pop front) > next_proposal.json (single) > ollama
+        # Priority: proposal_queue.json (array, pop front) > next_proposal.json (single) > Claude
         queue_file    = AUTORESEARCH_DIR / "proposal_queue.json"
         override_file = AUTORESEARCH_DIR / "next_proposal.json"
         if queue_file.exists():
@@ -481,14 +634,13 @@ def main():
                 train_text=TRAIN_PY.read_text(),
             )
         else:
-            log("Asking qwen3:8b for next experiment...")
-            proposal = ollama_propose(
+            proposal = claude_propose(
                 results_text=RESULTS.read_text(),
                 train_text=TRAIN_PY.read_text(),
             )
 
         if proposal is None:
-            log("Ollama failed to propose — using fallback: increase LR by 2x")
+            log("Claude failed to propose — using fallback: increase LR by 2x")
             proposal = {
                 "description": "lr x2 fallback",
                 "changes": []

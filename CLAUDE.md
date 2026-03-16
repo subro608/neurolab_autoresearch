@@ -71,7 +71,7 @@ autoloop.py runs forever as a background process:
 
 while True:
     1. Pop next proposal from proposal_queue.json
-       (fallback chain: queue → next_proposal.json → arxiv+qwen3 → qwen3:8b)
+       (fallback chain: queue → next_proposal.json → research_propose → claude_propose)
     2. Apply old→new string replacements to train.py
     3. Run: uv run python3 train.py         (TIME_BUDGET seconds, saves run_checkpoint.pt)
     4. Run: uv run python3 evaluate.py      (prints metric, e.g. probe_acc: 0.069770)
@@ -79,14 +79,18 @@ while True:
           YES → git commit train.py  (status=keep)
           NO  → git checkout train.py (status=discard, reverts to last kept state)
     6. Log to results.tsv
-    7. If queue empty + stuck (≥3 straight discards) → search arxiv → qwen3:8b proposes
+    7. If queue empty + stuck (≥3 straight discards):
+         a. autoloop queries arxiv + HuggingFace Papers via search_server.py (HTTP, no LLM tool call)
+         b. injects paper results as text into prompt
+         c. LLM backend proposes experiment from that context
+         d. fallback: LLM proposes from results history alone (no search)
     8. repeat
 ```
 
 **Stuck detection**: after `STUCK_THRESHOLD=3` consecutive discards with an empty queue,
-autoloop searches arxiv (5 queries) and feeds abstracts to `qwen3:8b` via Ollama.
-**This is optional** — if you keep `proposal_queue.json` filled (via any LLM supervisor),
-the loop never needs Ollama.
+`research_propose()` runs arxiv + HuggingFace searches **directly in Python** (via `search_server.py`)
+and injects the results as text into the LLM prompt. This is fully **backend-agnostic** — works with
+claude, codex, openai, or ollama. No special tool-calling support needed.
 
 ---
 
@@ -96,6 +100,9 @@ the loop never needs Ollama.
 autoresearch/
 ├── CLAUDE.md               ← you are here
 ├── autoloop.py             ← autonomous loop engine (never edit)
+├── search_server.py        ← FastMCP server: search_arxiv + search_huggingface_papers tools
+│                              also imported directly by autoloop for backend-agnostic search
+├── mcp_config.json         ← MCP config for connecting claude/codex to search_server.py
 ├── train.py                ← THE ONLY FILE the loop modifies
 ├── evaluate.py             ← locked ground-truth metric (never modify)
 ├── proposal_queue.json     ← pending experiments (FIFO queue, supervisor refills)
@@ -104,14 +111,13 @@ autoresearch/
 ├── autoloop_stdout.log     ← live loop output
 ├── dashboard.py            ← terminal TUI (ANSI, sparklines, live refresh)
 ├── monitor.py              ← older simpler dashboard
-├── ollama_agent.py         ← standalone qwen3:8b proposal agent (optional)
 ├── experiment.md           ← human-readable experiment notes
 ├── program.md              ← problem statement + hypotheses
 │                              (human edits this — ask the user, or help them draft it)
 ├── run_checkpoint.pt       ← best checkpoint from current/last run
 ├── run.log                 ← stdout from last train.py run
 ├── eval.log                ← stdout from last evaluate.py run
-├── pyproject.toml          ← uv project (torch, sklearn, transformers, etc.)
+├── pyproject.toml          ← uv project (torch, sklearn, transformers, fastmcp, httpx)
 └── .venv/                  ← managed by uv
 ```
 
@@ -298,9 +304,61 @@ SSL val_loss does NOT correlate with probe_acc — always use probe_acc.
 
 ## Supervisor Role (Claude / any LLM via cron)
 
-**You do NOT need Ollama or any local LLM to be a supervisor.** Any LLM (Claude, GPT, Gemini, etc.) can supervise by reading loop state and writing proposals. Ollama/qwen3 is only autoloop's last-resort fallback when the queue runs dry and it's been stuck.
+**You do NOT need any local LLM to be a supervisor.** Any LLM (Claude Code, GPT, Gemini, etc.) can supervise by reading loop state and writing proposals.
 
-A cron job triggers every 10 minutes with the standard check prompt. The supervisor should:
+### autoloop's built-in LLM fallback
+
+When the queue runs dry and the loop is stuck (≥3 consecutive discards), autoloop calls an LLM automatically. Select the backend via the `AUTOLOOP_LLM` environment variable:
+
+| Value | Backend | Web search | Notes |
+|-------|---------|------------|-------|
+| `claude` (default) | `claude --print` CLI | ✅ via search_server.py | Requires Claude Code installed |
+| `codex` | `codex exec` CLI | ✅ via search_server.py | Requires Codex CLI + login |
+| `openai` | OpenAI API (gpt-4o) | ✅ via search_server.py | Requires `OPENAI_API_KEY` |
+| `ollama` | Local Ollama REST API | ✅ via search_server.py | Set `OLLAMA_MODEL` (default: `qwen3:8b`) |
+| `none` | Disabled | — | Supervisor fills queue manually |
+
+All backends get **identical** arxiv + HuggingFace search results injected as text by
+`search_server.py` — no special tool-calling support required from the LLM.
+
+```bash
+# Start with Claude backend (default)
+nohup ~/.local/bin/uv run python3 autoloop.py >> autoloop_stdout.log 2>&1 &
+
+# Start with Codex CLI backend
+AUTOLOOP_LLM=codex nohup ~/.local/bin/uv run python3 autoloop.py >> autoloop_stdout.log 2>&1 &
+
+# Start with local Ollama (qwen3:8b)
+AUTOLOOP_LLM=ollama nohup ~/.local/bin/uv run python3 autoloop.py >> autoloop_stdout.log 2>&1 &
+
+# Start with OpenAI API
+AUTOLOOP_LLM=openai nohup ~/.local/bin/uv run python3 autoloop.py >> autoloop_stdout.log 2>&1 &
+```
+
+### search_server.py — standalone MCP tool server
+
+`search_server.py` doubles as a standalone FastMCP server that any MCP-compatible LLM
+client can connect to for interactive arxiv/HuggingFace search:
+
+```bash
+# Connect Claude Code interactively to the search server
+claude --mcp-config mcp_config.json "search arxiv for contrastive SSL brain decoding"
+
+# Connect Codex interactively
+codex exec -c 'mcp_servers=[{name="search",command="uv",args=["run","python","search_server.py"]}]' "..."
+```
+
+### What the LLM fallback does
+
+When stuck, autoloop calls `research_propose()` which:
+1. Gives the LLM the full `results.tsv` and current `train.py`
+2. Asks it to **generate its own search queries** and search arxiv + HuggingFace Papers
+3. Extracts one concrete, novel experiment proposal as JSON
+4. Falls back to a simple `claude_propose()` (no web search) if research mode fails
+
+### Supervisor cron check (every 10 min)
+
+A cron job triggers every 10 minutes. The supervisor should:
 
 1. Read last 30 lines of `autoloop_stdout.log`
 2. Read `results.tsv` and `proposal_queue.json`
@@ -309,7 +367,7 @@ A cron job triggers every 10 minutes with the standard check prompt. The supervi
    cd /path/to/autoresearch
    nohup ~/.local/bin/uv run python3 autoloop.py >> autoloop_stdout.log 2>&1 &
    ```
-4. **If queue < 3 items**: add 2–3 new proposals based on results history
+4. **If queue < 3 items**: add 2–3 new proposals based on results history — search arxiv/HuggingFace for novel ideas if stuck
 5. **Otherwise**: do nothing
 
 ---
@@ -365,6 +423,8 @@ Expected location: `<REPO_ROOT>/data/compact_atlas_5k/`
 
 ### Results History (as of 2026-03-16)
 
+**SSL era** (iters 1–22): `ssl_lambda_raw=1.0`, `dist_lambda_raw=0.0`
+
 | # | probe_acc | status | description |
 |---|-----------|--------|-------------|
 | 1 | 5.92% | keep | baseline HEBO HPs |
@@ -383,18 +443,28 @@ Expected location: `<REPO_ROOT>/data/compact_atlas_5k/`
 | 20 | 6.76% | discard | GRAD_ACCUM=8 + LR=2e-4 |
 | 21 | 5.08% | discard | cosine LR decay |
 | 22 | 5.01% | discard | mask_before_encoder=True |
-| 23+ | running | — | input_noise_std=0.05, average_top_k_layers=2, hidden_dropout=0.1, loss_type=cosine |
+| 23 | 5.32% | discard | input_noise_std=0.05 |
+| 24–28 | 0.0 (crash) | crash | hidden_dropout, loss_type=cosine, num_negatives=50 — distc config broken (use_coords bug) |
+
+**Distc era** (iters 29+): `ssl_lambda_raw=0.0`, `dist_lambda_raw=1.0` — spatial contrastive loss using CCF coordinates
+
+Bug fixed 2026-03-16: `use_coords` only checked `dist_lambda` (legacy key), missing `dist_lambda_raw` → coords never passed → loss=0. Fixed + added `dist_temperature=0.109`, `dist_sigma=32.4µm` from best raytune trial.
+
+| # | probe_acc | status | description |
+|---|-----------|--------|-------------|
+| 29 | TBD | running | distc baseline — establishing distc probe_acc floor |
 
 **Key findings**:
-- Only `real_signal_frames=150` (padding fix) + 2h budget ever reliably improved probe_acc
-- Aggressive changes to EMA, LR schedule, masking all hurt
-- Model stuck at ~7% — may need fundamentally different approach once queue is exhausted
+- SSL era: only `real_signal_frames=150` + 2h budget ever reliably improved probe_acc
+- SSL era stuck at ~7% — switched to distance contrastive (distc) objective
+- Distc uses CCF brain coordinates as spatial supervision signal for contrastive pairs
+- All distc crashes before fix were due to use_coords bug (not true distc failure)
 
 ### Environment
 
 - **Device**: Apple M3 Max MPS (no CUDA)
 - **Python env**: managed by `uv` → `~/.local/bin/uv run python3 <script>`
-- **Local LLM (optional)**: Ollama at `localhost:11434`, model `qwen3:8b`
+- **LLM backend**: Claude CLI (`claude --print`) via `AUTOLOOP_LLM` env var — no Ollama needed
 - **Git branch**: `autoresearch/init`
 - **Remote**: `https://github.com/subro608/Alphabrain_staging.git`
 

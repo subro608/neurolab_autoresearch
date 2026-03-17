@@ -622,9 +622,11 @@ def main():
             log(f"Iteration {iteration} done: probe_acc={probe_acc:.4f} status={status}")
 
         # 4+5. Propose next experiment
-        # Priority: proposal_queue.json (array, pop front) > next_proposal.json (single) > Claude
+        # Priority: proposal_queue.json (array, pop front) > next_proposal.json (single) > LLM
         queue_file    = AUTORESEARCH_DIR / "proposal_queue.json"
         override_file = AUTORESEARCH_DIR / "next_proposal.json"
+        proposal = None
+
         if queue_file.exists():
             queue = json.loads(queue_file.read_text())
             if queue:
@@ -633,22 +635,25 @@ def main():
                 queue_file.write_text(json.dumps(queue, indent=2))
             else:
                 queue_file.unlink()
-                proposal = None
-        elif override_file.exists():
+
+        if proposal is None and override_file.exists():
             log("Using manual override from next_proposal.json")
             proposal = json.loads(override_file.read_text())
             override_file.unlink()
-        elif is_stuck():
-            log(f"Stuck detected ({STUCK_THRESHOLD} consecutive discards/repeats) — entering deep research mode")
-            proposal = research_propose(
-                results_text=RESULTS.read_text(),
-                train_text=TRAIN_PY.read_text(),
-            )
-        else:
-            proposal = claude_propose(
-                results_text=RESULTS.read_text(),
-                train_text=TRAIN_PY.read_text(),
-            )
+
+        if proposal is None:
+            if is_stuck():
+                log(f"Stuck detected ({STUCK_THRESHOLD} consecutive discards/repeats) — entering deep research mode")
+                proposal = research_propose(
+                    results_text=RESULTS.read_text(),
+                    train_text=TRAIN_PY.read_text(),
+                )
+            else:
+                log("Queue empty — asking LLM for next experiment...")
+                proposal = claude_propose(
+                    results_text=RESULTS.read_text(),
+                    train_text=TRAIN_PY.read_text(),
+                )
 
         if proposal is None:
             log("Claude failed to propose — using fallback: increase LR by 2x")
